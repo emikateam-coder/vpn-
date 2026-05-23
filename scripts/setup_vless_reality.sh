@@ -107,13 +107,18 @@ setup_ssh_tunnel() {
 
     sleep 2
 
-    if curl -s --connect-timeout 5 "http://127.0.0.1:${local_port}/" &>/dev/null; then
-        log_ok "SSH tunnel established on port ${local_port}"
+    if curl -sk --connect-timeout 5 "https://127.0.0.1:${local_port}/" &>/dev/null; then
+        log_ok "SSH tunnel established on port ${local_port} (HTTPS)"
         return 0
     fi
 
-    if curl -s --connect-timeout 5 "http://127.0.0.1:${local_port}/login" &>/dev/null; then
-        log_ok "SSH tunnel established on port ${local_port}"
+    if curl -s --connect-timeout 5 "http://127.0.0.1:${local_port}/" &>/dev/null; then
+        log_ok "SSH tunnel established on port ${local_port} (HTTP)"
+        return 0
+    fi
+
+    if curl -sk --connect-timeout 5 "https://127.0.0.1:${local_port}/login" &>/dev/null; then
+        log_ok "SSH tunnel established on port ${local_port} (HTTPS)"
         return 0
     fi
 
@@ -166,7 +171,7 @@ generate_reality_keys_on_server() {
         -o ConnectTimeout=10 \
         -p "${VPS_SSH_PORT}" \
         "${VPS_SSH_USER}@${VPS_HOST}" \
-        'docker exec 3x-ui /app/bin/xray x25519 2>/dev/null || /usr/local/bin/xray x25519 2>/dev/null || xray x25519 2>/dev/null' 2>/dev/null)
+        '/usr/local/x-ui/bin/xray-linux-amd64 x25519 2>/dev/null || /usr/local/bin/xray x25519 2>/dev/null || xray x25519 2>/dev/null || docker exec 3x-ui /app/bin/xray x25519 2>/dev/null' 2>/dev/null)
 
     REALITY_PRIVATE_KEY=$(echo "$output" | grep -i "private" | awk '{print $NF}')
     REALITY_PUBLIC_KEY=$(echo "$output" | grep -i "public" | awk '{print $NF}')
@@ -210,15 +215,43 @@ harden_panel() {
     log_info "New panel pass: ${NEW_PANEL_PASS}"
     log_info "New panel path: ${NEW_PANEL_PATH}"
 
+    log_info "Updating panel port, path, and listen address..."
+    local settings_data
+    settings_data="webPort=${NEW_PANEL_PORT}&webBasePath=${NEW_PANEL_PATH}"
+    settings_data+="&webListen=127.0.0.1&webDomain=127.0.0.1"
+    settings_data+="&subEnable=true&subPort=2096&subPath=/sub/&subDomain="
+    settings_data+="&subCertFile=&subKeyFile=&subUpdates=12&subEncrypt=true"
+    settings_data+="&subShowInfo=false&subURI=&subJsonURI=&subJsonFragment="
+    settings_data+="&subJsonMux=&subJsonRules="
+    settings_data+="&timeLocation=UTC&webCertFile=&webKeyFile="
+    settings_data+="&secretEnable=false&loginRemindEnable=true&datepicker=gregorian"
+    settings_data+="&tgBotEnable=false&tgExpireDiff=0&tgTrafficDiff=0&tgCpu=0"
+    settings_data+="&tgBotToken=&tgBotChatId=&tgRunTime=@daily&tgBotBackup=false"
+    settings_data+="&tgBotLoginNotify=true&tgLang=en-US&remarkModel=-1"
+
+    local update_result
+    update_result=$(xui_update_setting "$settings_data")
+    log_info "Settings update response: ${update_result}"
+
+    local update_success
+    update_success=$(echo "$update_result" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [[ "$update_success" != "true" ]]; then
+        log_error "Failed to update panel settings: $update_result"
+    fi
+
     log_info "Updating panel credentials..."
     local cred_result
-    cred_result=$(xui_update_setting "oldUsername=${PANEL_USER}&oldPassword=${PANEL_PASS}&newUsername=${NEW_PANEL_USER}&newPassword=${NEW_PANEL_PASS}")
+    cred_result=$(xui_update_user "$PANEL_USER" "$PANEL_PASS" "$NEW_PANEL_USER" "$NEW_PANEL_PASS")
     log_info "Credentials update response: ${cred_result}"
 
-    log_info "Updating panel listen address, port and path..."
-    local settings_result
-    settings_result=$(xui_update_setting "webListen=127.0.0.1&webDomain=127.0.0.1&webPort=${NEW_PANEL_PORT}&webBasePath=${NEW_PANEL_PATH}")
-    log_info "Settings update response: ${settings_result}"
+    local cred_success
+    cred_success=$(echo "$cred_result" | jq -r '.success // false' 2>/dev/null || echo "false")
+    if [[ "$cred_success" != "true" ]]; then
+        log_error "Failed to update credentials: $cred_result"
+        log_warn "Continuing with old credentials..."
+        NEW_PANEL_USER="$PANEL_USER"
+        NEW_PANEL_PASS="$PANEL_PASS"
+    fi
 
     log_info "Opening firewall for new panel port (if ufw is active)..."
     sshpass -p "${VPS_SSH_PASSWORD}" ssh \
@@ -228,16 +261,58 @@ harden_panel() {
         "${VPS_SSH_USER}@${VPS_HOST}" \
         "ufw allow ${NEW_PANEL_PORT}/tcp 2>/dev/null; ufw allow 443/tcp 2>/dev/null; true" 2>/dev/null || true
 
-    log_info "Restarting panel with new settings..."
-    xui_restart_panel
-    sleep 5
+    log_info "Restarting panel via systemctl on the server..."
+    sshpass -p "${VPS_SSH_PASSWORD}" ssh \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 \
+        -p "${VPS_SSH_PORT}" \
+        "${VPS_SSH_USER}@${VPS_HOST}" \
+        "systemctl restart x-ui 2>/dev/null || (docker restart 3x-ui 2>/dev/null) || true" 2>/dev/null
 
     kill_ssh_tunnels
-    sleep 2
+    sleep 5
 
+    log_info "Waiting for panel to restart with new settings..."
+    local retries=0
+    local max_retries=12
     local tunnel_port
     tunnel_port=$(shuf -i 20000-30000 -n 1)
-    setup_ssh_tunnel "$tunnel_port" "$NEW_PANEL_PORT"
+
+    while [[ $retries -lt $max_retries ]]; do
+        retries=$((retries + 1))
+
+        pkill -f "ssh.*-L.*${tunnel_port}" 2>/dev/null || true
+        sleep 1
+
+        sshpass -p "${VPS_SSH_PASSWORD}" ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -p "${VPS_SSH_PORT}" \
+            -L "${tunnel_port}:127.0.0.1:${NEW_PANEL_PORT}" \
+            -N -f \
+            "${VPS_SSH_USER}@${VPS_HOST}" 2>/dev/null || true
+
+        sleep 3
+
+        if curl -sk --connect-timeout 5 "https://127.0.0.1:${tunnel_port}${NEW_PANEL_PATH}" -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|301|302)$"; then
+            log_ok "Panel is back online (attempt ${retries}/${max_retries})"
+            break
+        fi
+
+        if curl -s --connect-timeout 5 "http://127.0.0.1:${tunnel_port}${NEW_PANEL_PATH}" -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|301|302)$"; then
+            log_ok "Panel is back online via HTTP (attempt ${retries}/${max_retries})"
+            break
+        fi
+
+        log_info "Panel not ready yet, retrying (${retries}/${max_retries})..."
+        sleep 5
+    done
+
+    if [[ $retries -ge $max_retries ]]; then
+        log_warn "Panel may not have restarted properly, attempting connection anyway..."
+    fi
 
     log_info "Reconnecting with new credentials..."
     connect_to_panel "127.0.0.1" "$tunnel_port" "$NEW_PANEL_PATH" "$NEW_PANEL_USER" "$NEW_PANEL_PASS"
@@ -496,7 +571,7 @@ create_inbound_alternative() {
         -o UserKnownHostsFile=/dev/null \
         -p "${VPS_SSH_PORT}" \
         "${VPS_SSH_USER}@${VPS_HOST}" \
-        "docker exec 3x-ui /app/bin/xray x25519 2>/dev/null" || true
+        "/usr/local/x-ui/bin/xray-linux-amd64 x25519 2>/dev/null || xray x25519 2>/dev/null" || true
 
     log_warn "Alternative method: Please create the inbound manually through the panel."
     log_warn "The keys and UUIDs have been generated and saved."
@@ -737,12 +812,18 @@ main() {
 
     test_server_connectivity
 
-    local tunnel_port
-    tunnel_port=$(shuf -i 20000-30000 -n 1)
-    setup_ssh_tunnel "$tunnel_port" "$PANEL_PORT"
-    CURRENT_TUNNEL_PORT="$tunnel_port"
-
-    connect_to_panel "127.0.0.1" "$tunnel_port" "/" "$PANEL_USER" "$PANEL_PASS"
+    if curl -sk --connect-timeout 5 "https://${VPS_HOST}:${PANEL_PORT}/" -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|301|302|403)$" || \
+       curl -s --connect-timeout 5 "http://${VPS_HOST}:${PANEL_PORT}/" -o /dev/null -w "%{http_code}" 2>/dev/null | grep -qE "^(200|301|302|403)$"; then
+        log_info "Panel is directly accessible at ${VPS_HOST}:${PANEL_PORT}"
+        connect_to_panel "$VPS_HOST" "$PANEL_PORT" "/" "$PANEL_USER" "$PANEL_PASS"
+    else
+        log_info "Panel not directly accessible, using SSH tunnel..."
+        local tunnel_port
+        tunnel_port=$(shuf -i 20000-30000 -n 1)
+        setup_ssh_tunnel "$tunnel_port" "$PANEL_PORT"
+        CURRENT_TUNNEL_PORT="$tunnel_port"
+        connect_to_panel "127.0.0.1" "$tunnel_port" "/" "$PANEL_USER" "$PANEL_PASS"
+    fi
 
     harden_panel
 
