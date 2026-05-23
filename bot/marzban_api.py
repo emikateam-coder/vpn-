@@ -58,6 +58,7 @@ class MarzbanAPI:
         data_limit_gb: int = 0,
         expire_days: int = 0,
         promo_code: str | None = None,
+        inbound_tag: str = "VLESS_REALITY",
     ) -> dict | None:
         import uuid as uuid_mod
 
@@ -73,7 +74,7 @@ class MarzbanAPI:
                     "flow": "xtls-rprx-vision",
                 }
             },
-            "inbounds": {"vless": ["VLESS_REALITY"]},
+            "inbounds": {"vless": [inbound_tag]},
             "data_limit": data_limit_gb * 1024 * 1024 * 1024 if data_limit_gb else 0,
             "expire": expire_ts,
             "status": "active",
